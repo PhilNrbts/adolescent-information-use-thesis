@@ -1,0 +1,905 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Some setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Loading required libraries
+pacman::p_load(tidyverse, rjson, DEoptim, doParallel, readr, here, jsonlite, modi, gplots)
+
+# Importing external R script with model fitting code
+source("../C_modelfittingCode/models.R")
+
+```
+
+In the following code block, we will import the dataset and perform various transformations on it. The code will produce several new variables:
+
+length_exploitation: Represents the duration of cell repetition, counted from the end.
+length_exploration: Specifies when a participant first reselects a previously chosen tile.
+similar: A boolean variable indicating whether the current cell selection is the same as the previous one.
+threshold_accumulation: The points at the trial just after exploitation begins.
+threshold_exploitation: The points at the trial just before exploitation ends.
+phases: Categorizes each trial into one of the four phases - exploration, accumulation, exploitation, or gem, depending on certain conditions.
+visited_this_round: Cumulative count of cell reselections within a round.
+known_cell: A boolean variable indicating whether a cell has been visited in the current round.
+
+# Importing data, creating variables, and summary tables
+
+```{r}
+
+library(tidyverse)
+library(readr)
+library(dplyr)
+
+### Load the data
+
+explore_data <- read_csv(file = "../data/social/data_social_coord.csv")
+explore_data_adolescence <- read_csv(file = "../data/social/data_social_coord_schoolbactch_1.csv")
+
+### Add a 'group' column to each data frame
+
+explore_data <- explore_data %>% mutate(group = "adults")
+explore_data_adolescence <- explore_data_adolescence %>% mutate(group = "adolescents")
+
+### Merge the data frames
+
+data <- bind_rows(explore_data, explore_data_adolescence)
+
+### Find the maximum 'unique_rounds' in the adolescent sample
+
+max_unique_rounds_adolescents <- max(data[data$group == "adolescents", "unique_rounds"], na.rm = TRUE)
+max_player_adolescents <- max(data[data$group == "adolescents", "player"], na.rm = TRUE)
+
+### Increase 'unique_rounds' for adults by the maximum 'unique_rounds' in the adolescent sample
+
+data[data$group == "adults", "unique_rounds"] <- data[data$group == "adults", "unique_rounds"] + max_unique_rounds_adolescents
+data[data$group == "adults", "player"] <- data[data$group == "adults", "player"] + max_unique_rounds_adolescents
+
+### Remove rows where 'cell', 'x', or 'y' are NA
+
+data <- data %>% filter(!is.na(cell), !is.na(x), !is.na(y))
+
+### Sort the data by player and round
+
+data <- data %>% arrange(player, round)
+
+### Importing and sorting the data by player and round
+
+data <- data %>%
+  group_by(player, round) %>%
+  arrange(unique_rounds, trial) %>%
+  mutate(similar = lag(cells) == cells) %>%
+  arrange(unique_rounds, desc(trial)) %>%
+  mutate(
+    length_exploitation = match(FALSE, similar, nomatch = max(trial)) - 1
+  ) %>%
+  ungroup() %>%
+  group_by(player, unique_rounds) %>%
+  arrange(trial) %>%
+  mutate(
+    length_exploration = match(TRUE, duplicated(cells), nomatch = max(trial)) - 1
+  ) %>%
+  ungroup() %>%
+  arrange(unique_rounds, desc(trial)) %>%
+  group_by(player, unique_rounds) %>%
+  mutate(
+    threshold_accumulation = points[match(length_exploitation + 1, trial)],
+    threshold_exploitation = points[match(25 - length_exploitation, trial)]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    phases = case_when(
+      trial <= length_exploration ~ "exploration",
+      trial > length_exploration & trial < (25 - length_exploitation + 1) ~ "accumulation",
+      trial >= (25 - length_exploitation) ~ "exploitation",
+      TRUE ~ "other" # Any other case
+    )
+  ) %>%
+  mutate(phases = if_else(!is.na(round_gem_found) & trial > round_gem_found, "gem", phases)) %>%
+  ungroup() %>%
+  arrange(player, unique_rounds, trial) %>% # Rearrange data in ascending order by player, unique_rounds and trial before computing visited_this_round
+  group_by(player, unique_rounds, cells) %>% # Group by player, unique_rounds and cells to compute visited_this_round
+  mutate(visited_this_round = cumsum(duplicated(cells))) %>%
+  ungroup() %>%
+  mutate(
+    known_cell = visited_this_round > 0,
+    threshold_accumulation = if_else(threshold_accumulation > 180, NA, threshold_accumulation),
+    threshold_exploitation = if_else(threshold_exploitation > 180, NA, threshold_exploitation)
+  ) %>%
+  
+  arrange(player, unique_rounds, trial) # Finally, rearrange data in ascending order by player, unique_rounds and trial
+
+# Calculate length_accumulation for each player and round
+data <- data %>%
+  group_by(player, round) %>%
+  mutate(
+    trial_exploitation = 26 - length_exploitation,
+    trial_accumulation = length_exploration + 1,
+    length_accumulation = trial_exploitation - trial_accumulation
+  ) %>%
+  ungroup()
+
+data <- data %>%
+  group_by(player, round) %>%
+  mutate(color_class_change = color_class - lag(color_class),
+         previous_color_class = lag(color_class)
+         ) %>%
+  ungroup()
+
+# Creating a summary dataset
+summary_data <- data %>%
+  select(unique_rounds, player, round, length_exploitation, length_exploration, threshold_accumulation, threshold_exploitation) %>%
+  distinct() %>%
+  mutate(
+    trial_exploitation = 26 - length_exploitation,
+    trial_accumulation = length_exploration + 1,
+    length_accumulation = trial_exploitation - trial_accumulation
+  )
+# Join the 'color_class' column from 'data' to 'summary_data'
+summary_data <- summary_data %>%
+  left_join(
+    data %>% 
+      select(unique_rounds, player, color_class) %>%
+      distinct(),
+    by = c("unique_rounds", "player")
+  )
+
+# Viewing the summary data and main data
+head(summary_data)
+head(data)
+```
+
+
+# Observational tests:
+
+# Heat maps 
+
+## for the first move:
+
+```{r}
+# Select data from the first trials only and count cell frequencies
+first_trials_counts <- get_first_trials(data, 1)
+
+# Compute weighted means and standard deviations
+weighted_metrics <- get_weighted_metrics(first_trials_counts)
+w_avg_x <- weighted_metrics$w_avg_x
+w_avg_y <- weighted_metrics$w_avg_y
+w_std_x <- weighted_metrics$w_std_x
+w_std_y <- weighted_metrics$w_std_y
+
+# Create matrices for frequencies and relative frequencies
+mat <- get_matrices(first_trials_counts)
+
+# Calculate quadrant frequencies
+quadrant_freq <- get_quadrant_freq(mat)
+print(round(quadrant_freq,3))
+
+# Chi-square test for goodness-of-fit
+chisq_test_result <- get_chisq_test_result(quadrant_freq)
+
+# Print the result
+print(chisq_test_result)
+
+# Print first move metrics
+first_move_metrics <- get_first_move_metrics(w_avg_x, w_avg_y, w_std_x, w_std_y)
+print(first_move_metrics)
+
+# Create heatmaps
+generate_heatmap(mat, mat, "First Trial for each Round.\nCell Selection, Absolute Numbers")
+generate_heatmap(mat, mat, "First Trial for each Round.\nCell Selection, Relative Numbers")
+```
+
+Heat map for all moves:
+
+```{r}
+# Define the range of trials to consider
+turns_range <- 1:25
+
+# Select data from the first trials only and count cell frequencies
+first_trials_counts <- get_first_trials(data, turns_range)
+
+# Compute weighted means and standard deviations
+weighted_metrics <- get_weighted_metrics(first_trials_counts)
+w_avg_x <- weighted_metrics$w_avg_x
+w_avg_y <- weighted_metrics$w_avg_y
+w_std_x <- weighted_metrics$w_std_x
+w_std_y <- weighted_metrics$w_std_y
+
+# Create matrices for frequencies and relative frequencies
+mat <- get_matrices(first_trials_counts)
+rel_mat <- get_rel_matrix(first_trials_counts)
+
+# Calculate quadrant frequencies
+quadrant_freq <- get_quadrant_freq(mat)
+print(round(quadrant_freq,3))
+
+# Chi-square test for goodness-of-fit
+chisq_test_result <- get_chisq_test_result(quadrant_freq)
+print(chisq_test_result)
+
+# Print first move metrics
+first_move_metrics <- get_first_move_metrics(w_avg_x, w_avg_y, w_std_x, w_std_y)
+print(first_move_metrics)
+
+# Create heatmaps
+generate_heatmap(mat, mat, "First Trial for each Round.\nCell Selection, Absolute Numbers")
+generate_heatmap(rel_mat, rel_mat, "First Trial for each Round.\nCell Selection, Relative Numbers")
+```
+
+Heat map for all moves excluding exploitation
+
+```{r}
+# Calculate length_accumulation in the data dataframe
+data <- data %>%
+  group_by(player, unique_rounds) %>%
+  mutate(
+    trial_exploitation = 26 - length_exploitation,
+    trial_accumulation = length_exploration + 1,
+    length_accumulation = trial_exploitation - trial_accumulation
+  ) %>%
+  ungroup()
+
+joined_data <- data %>%
+  left_join(summary_data, by = c("unique_rounds", "player", "round")) %>%
+  group_by(player) %>%
+  filter(data$trial < data$trial_exploitation)
+
+
+
+# Check the result
+head(joined_data)
+
+
+# Calculate trial_exploitation in the data dataframe
+data <- data %>%
+  group_by(player, unique_rounds) %>%
+  mutate(
+    trial_exploitation = 26 - length_exploitation
+  ) %>%
+  ungroup()
+
+# Join data with summary_data on unique_rounds and filter the trials
+joined_data <- data %>%
+  left_join(summary_data, by = c("unique_rounds", "player", "round")) %>%
+  group_by(unique_rounds) %>%
+  filter(trial < trial_exploitation)
+
+# Create the new dataframe with relative frequencies and group by player
+new_data <- joined_data %>%
+  count(player, cell) %>%
+  group_by(player) %>%
+  mutate(rel_Freq = n / sum(n),
+         Var1 = as.character(cell),
+         x = cell %% 8,
+         y = cell %/% 8)
+
+# Calculate sum of rel_Freq for each cell and then divide by total number of players
+first_trials_counts <- new_data %>%
+  group_by(cell, x, y) %>%
+  summarise(rel_Freq = sum(rel_Freq), .groups = "drop") %>%
+  mutate(rel_Freq = (rel_Freq / n_distinct(new_data$player)) * 64)
+
+# Initialize an 8x8 matrix and fill with relative frequencies
+mat <- matrix(0, nrow = 8, ncol = 8)
+for(i in 1:nrow(first_trials_counts)) {
+  mat[first_trials_counts$y[i] + 1, first_trials_counts$x[i] + 1] <- first_trials_counts$rel_Freq[i]
+}
+
+mat <- round(mat, 3)
+
+# Calculate quadrant frequencies
+quadrant_freq <- c(
+  Q1 = sum(mat[1:4, 5:8]),
+  Q2 = sum(mat[1:4, 1:4]),
+  Q3 = sum(mat[5:8, 1:4]),
+  Q4 = sum(mat[5:8, 5:8])
+)
+print(round(quadrant_freq, 3))
+
+# Perform Chi-Square Test
+chisq_test_result <- chisq.test(quadrant_freq)
+print(chisq_test_result)
+
+# Generate heatmap
+title <- paste("First Trial for each Round.","\n", "Cell Selection, Relative Numbers")
+heatmap.2(mat, trace = "none", dendrogram = "none", Rowv = FALSE, Colv = FALSE,
+          margins = c(5, 5), cellnote = mat, notecex = 1, notecol = "black",
+          main = title)
+
+# Print sum of relative frequencies, should be approximately 64 (8x8 grid)
+print(sum(first_trials_counts$rel_Freq))
+```
+
+Determine distances
+
+```{r}
+# Load necessary packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Prepare dataframes
+previous_data <- data %>%
+  arrange(unique_rounds, trial) %>%
+  select(player, unique_rounds, trial, cell, x, y, points, color_class, group)
+
+move_data <- data %>%
+  filter(social_info_use == "ignore", similar == FALSE, trial != 1) %>%
+  group_by(unique_rounds) %>%
+  arrange(unique_rounds, trial) %>%
+  filter(!duplicated(cell)) %>%
+  select(player, trial, round, unique_rounds, cell, x, y, group) %>%
+  mutate(previous_trial = trial - 1)
+
+# Join move_data with previous_data for previous_trial data
+move_data <- move_data %>%
+  left_join(previous_data,
+            by = c("player", "unique_rounds", "previous_trial" = "trial"),
+            suffix = c("", "_previous")) %>%
+  rename(previous_cell = cell_previous, 
+         previous_x = x_previous, 
+         previous_y = y_previous, 
+         previous_points = points) %>%
+  mutate(distance = sqrt((x - previous_x)^2 + (y - previous_y)^2)) %>%
+  arrange(player, unique_rounds, previous_trial) %>%
+  group_by(unique_rounds) %>%
+  mutate(consecutive = c(1, diff(previous_trial)) == 1,
+         exploration = ifelse(row_number() == 1, TRUE, consecutive)) %>%
+  select(-consecutive)
+
+# Summarize data
+ex_data_summary <- move_data %>%
+  group_by(exploration) %>%
+  summarise(mean_distance = mean(distance, na.rm = TRUE),
+            sd_distance = sd(distance, na.rm = TRUE), .groups = "drop")
+
+move_data_summary <- move_data %>%
+  group_by(player, group) %>%
+  summarise(mean_distance = mean(distance, na.rm = TRUE),
+            sd_distance = sd(distance, na.rm = TRUE), .groups = "drop")
+
+# Perform ANOVA and correlation test
+anova_results <- aov(mean_distance ~ player, data = move_data_summary)
+correlation_test <- cor.test(move_data$previous_points,move_data$distance,use = "pairwise.complete.obs")
+
+# Print summaries
+summary(anova_results)
+print(correlation_test)
+
+# Create plots
+hist(move_data$distance)
+
+ggplot(move_data, aes(x=distance, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Distance", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Distances by Player")
+
+# View the move_data
+head(move_data)
+
+# Perform ANOVA to compare distances between groups
+anova_results <- aov(mean_distance ~ group, data = move_data_summary)
+summary(anova_results)
+
+# Create layered histograms
+ggplot(move_data_summary, aes(x = mean_distance, fill = group)) +
+  geom_histogram(alpha = 0.5, position = 'identity', bins = 30) +
+  theme_minimal() +
+  labs(x = "Mean Distance", y = "Count", fill = "Group",
+       title = "Layered Histogram of Mean Distances by Group")
+```
+
+# Explore phases 
+
+## Importantly, I removed gems from thresholds earlier, since gems are not really informative.
+
+```{r}
+#Determine meaningful social_information
+data <- data %>%
+  arrange(player, round, unique_rounds, trial) %>%
+  group_by(player, round, unique_rounds) %>%
+  mutate(similar_social_info = lag(social_info) == social_info,
+         similar_social_info = replace_na(similar_social_info, FALSE)) %>%
+  mutate(social_value = cumsum(similar_social_info)) %>%
+  ungroup()
+
+#Histogram for the phases
+
+
+
+## Descriptive exploration
+
+## Calculate mean and median for the entire group
+overall_stats <- data %>%
+  summarise(
+    mean_length_exploitation = mean(length_exploitation, na.rm = TRUE),
+    median_length_exploitation = median(length_exploitation, na.rm = TRUE),
+    mean_length_exploration = mean(length_exploration, na.rm = TRUE),
+    median_length_exploration = median(length_exploration, na.rm = TRUE),
+    mean_threshold_accumulation = mean(threshold_accumulation, na.rm = TRUE),
+    median_threshold_accumulation = median(threshold_accumulation, na.rm = TRUE),
+    mean_threshold_exploitation = mean(threshold_exploitation, na.rm = TRUE),
+    median_threshold_exploitation = median(threshold_exploitation, na.rm = TRUE)
+  )
+
+## Calculate mean and median for each group separately
+group_stats <- data %>%
+  group_by(group) %>%
+  summarise(
+    mean_length_exploitation = mean(length_exploitation, na.rm = TRUE),
+    median_length_exploitation = median(length_exploitation, na.rm = TRUE),
+    mean_length_exploration = mean(length_exploration, na.rm = TRUE),
+    median_length_exploration = median(length_exploration, na.rm = TRUE),
+    mean_threshold_accumulation = mean(threshold_accumulation, na.rm = TRUE),
+    median_threshold_accumulation = median(threshold_accumulation, na.rm = TRUE),
+    mean_threshold_exploitation = mean(threshold_exploitation, na.rm = TRUE),
+    median_threshold_exploitation = median(threshold_exploitation, na.rm = TRUE)
+  )
+
+## Combine the overall and group statistics into a single table
+combined_stats <- bind_rows(overall_stats, group_stats)
+print(combined_stats)
+
+## Create a function to generate the superimposed histogram
+generate_histogram <- function(data, column_name, title) {
+  ggplot(data, aes_string(x = column_name, fill = "group")) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+    labs(x = title, y = "Count", fill = "Group",
+         title = paste("Histogram of", title, "by Group")) +
+    theme_minimal()
+}
+
+## Generate the superimposed histograms
+generate_histogram(data, "length_exploration", "Length of Exploration")
+generate_histogram(data, "threshold_accumulation", "Threshold of Accumulation")
+generate_histogram(data, "length_accumulation", "Length of Accumulation")
+generate_histogram(data, "threshold_exploitation", "Threshold of Exploitation")
+generate_histogram(data, "length_exploitation", "Length of Exploitation")
+
+## length_exploration
+t.test(summary_data$length_exploration, mu = 0)
+summary(aov(length_exploration ~ player, data = summary_data))
+
+ggplot(summary_data, aes(x=length_exploration, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Length of Exploration", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Length of Exploration by Player")
+
+## threshold_accumulation
+ggplot(summary_data, aes(x=threshold_accumulation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Threshold of Accumulation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Threshold of Accumulation by Player")
+
+#% Create a histogram that starts at 0
+
+t.test(summary_data$length_accumulation, mu = 0)
+summary(aov(length_accumulation ~ player, data = summary_data))
+
+ggplot(summary_data, aes(x=length_accumulation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Length of Accumulation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Length of Accumulation by Player")
+
+
+## threshold_exploitation
+hist(summary_data$threshold_exploitation)
+
+ggplot(summary_data, aes(x=threshold_exploitation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Threshold of Exploitation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Threshold of Exploitation by Player")
+
+## length_exploitation
+hist(summary_data$length_exploitation)
+summary(aov(length_exploitation ~ player, data = summary_data))
+
+ggplot(summary_data, aes(x=length_exploitation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Length of Exploitation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Length of Exploitation by Player")
+
+## ANOVA
+anova_result <- aov(length_exploitation ~ player, data = summary_data)
+
+## Check ANOVA summary
+summary(anova_result)
+
+hist(summary_data$length_exploration)
+
+
+
+
+
+## length_exploration
+hist(summary_data$length_exploration)
+t.test(summary_data$length_exploration, mu = 0)
+summary(aov(length_exploration ~ player, data = summary_data))
+
+ggplot(summary_data, aes(x=length_exploration, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Length of Exploration", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Length of Exploration by Player")
+
+## threshold_accumulation
+hist(summary_data$threshold_accumulation)
+
+ggplot(summary_data, aes(x=threshold_accumulation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Threshold of Accumulation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Threshold of Accumulation by Player")
+
+## Create a histogram that starts at 0
+hist(summary_data$length_accumulation, xlim = c(0, max(summary_data$length_accumulation)))
+t.test(summary_data$length_accumulation, mu = 0)
+summary(aov(length_accumulation ~ player, data = summary_data))
+
+ggplot(summary_data, aes(x=length_accumulation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Length of Accumulation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Length of Accumulation by Player")
+
+
+## threshold_exploitation
+hist(summary_data$threshold_exploitation)
+
+ggplot(summary_data, aes(x=threshold_exploitation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Threshold of Exploitation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Threshold of Exploitation by Player")
+
+## length_exploitation
+hist(summary_data$length_exploitation)
+summary(aov(length_exploitation ~ player, data = summary_data))
+
+ggplot(summary_data, aes(x=length_exploitation, color=as.factor(player), fill=as.factor(player))) +
+  geom_density(alpha=0.5) +
+  theme_minimal() +
+  labs(x="Length of Exploitation", y="Density", color="Player", fill="Player", 
+       title="Density Plot of Length of Exploitation by Player")
+
+## ANOVA
+anova_result <- aov(length_exploitation ~ player, data = summary_data)
+
+## Check ANOVA summary
+summary(anova_result)
+
+hist(summary_data$length_exploration)
+
+```
+
+```{r}
+# For threshold_accumulation
+ggplot(summary_data, aes(x=threshold_accumulation_color_class, fill=as.factor(threshold_accumulation_color_class))) +
+  geom_bar(position="identity", alpha=0.5, width=1) +
+  labs(x="Threshold Accumulation Color Class", y="Count", fill="Color Class") +
+  theme_minimal()
+
+# For threshold_exploitation
+ggplot(summary_data, aes(x=threshold_exploitation_color_class, fill=as.factor(threshold_exploitation_color_class))) +
+  geom_bar(position="identity", alpha=0.5, width=1) +
+  labs(x="Threshold Exploitation Color Class (adjusted)", y="Count", fill="Color Class") +
+  theme_minimal()
+
+```
+
+```{r}
+# Checking out Exploration and social information usage
+
+explore_stats <- data %>%
+  filter(phases == "exploration") %>%
+  group_by(player) %>%
+  summarise(
+    n_player_exploration = n(),
+    n_copy_no_social_value = sum(social_info_use == "copy" & social_value == 0),
+    n_copy_social_value = sum(social_info_use == "copy" & social_value > 0),
+    mean_social_value = mean(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE),
+    median_social_value = median(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE)
+  )
+# Output the summary statistics
+print(explore_stats)
+
+# Some accumulation statistics
+accumulate_stats <- data %>%
+  filter(phases == "accumulation") %>%
+  group_by(player) %>%
+  summarise(
+    n_player_accumulation = n(),
+    n_copy_no_social_value = sum(social_info_use == "copy" & social_value == 0),
+    n_copy_social_value = sum(social_info_use == "copy" & social_value > 0),
+    mean_social_value = mean(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE),
+    median_social_value = median(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE),
+    n_visit_known_cell = sum(known_cell > 0),
+    n_visit_new_cell = sum(known_cell == 0)
+  )
+# Output the summary statistics
+print(accumulate_stats)
+
+known_cell_summary <- data %>%
+  filter(phases == "accumulation", trial != 2) %>%
+  group_by(trial) %>%
+  summarise(
+    true_count = sum(known_cell == TRUE),
+    false_count = sum(known_cell == FALSE),
+    total = n(),
+    ratio_true_to_total = true_count / total
+  )
+
+head(known_cell_summary)
+
+# Plot the ratio over trials
+ggplot(known_cell_summary, aes(x = trial, y = ratio_true_to_total)) +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  theme_minimal() +
+  labs(x = "Trial", y = "Ratio of Known Cell to Total", title = "Ratio of Known Cells over Trials")
+
+
+social_cell_summary <- data %>%
+  filter(phases == "accumulation") %>%
+  group_by(trial) %>%
+  summarise(
+    true_count = sum(social_info_use == "copy"),
+    false_count = sum(social_info_use == "ignore"),
+    total = n(),
+    ratio_true_to_total = true_count / total
+  )
+
+head(social_cell_summary)
+
+# Plot the ratio over trials
+ggplot(social_cell_summary, aes(x = trial, y = ratio_true_to_total)) +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  theme_minimal() +
+  labs(x = "Trial", y = "Ratio of Known Cell to Total", title = "Ratio of Known Cells over Trials")
+
+```
+
+```{r}
+# Checking out Exploration and social information usage
+
+explore_stats <- data %>%
+  filter(phases == "exploration") %>%
+  group_by(player) %>%
+  summarise(
+    n_player_exploration = n(),
+    n_copy_no_social_value = sum(social_info_use == "copy" & social_value == 0),
+    n_copy_social_value = sum(social_info_use == "copy" & social_value > 0),
+    mean_social_value = mean(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE),
+    median_social_value = median(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE)
+  )
+# Output the summary statistics
+print(explore_stats)
+
+# Some accumulation statistics
+accumulate_stats <- data %>%
+  filter(phases == "accumulation") %>%
+  group_by(player) %>%
+  summarise(
+    n_player_accumulation = n(),
+    n_copy_no_social_value = sum(social_info_use == "copy" & social_value == 0),
+    n_copy_social_value = sum(social_info_use == "copy" & social_value > 0),
+    mean_social_value = mean(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE),
+    median_social_value = median(social_value[social_info_use == "copy" & social_value > 0], na.rm = TRUE),
+    n_visit_known_cell = sum(known_cell > 0),
+    n_visit_new_cell = sum(known_cell == 0)
+  )
+# Output the summary statistics
+print(accumulate_stats)
+
+known_cell_summary <- data %>%
+  filter(phases == "accumulation", trial != 2) %>%
+  group_by(trial) %>%
+  summarise(
+    true_count = sum(known_cell == TRUE),
+    false_count = sum(known_cell == FALSE),
+    total = n(),
+    ratio_true_to_total = true_count / total
+  )
+
+head(known_cell_summary)
+
+# Plot the ratio over trials
+ggplot(known_cell_summary, aes(x = trial, y = ratio_true_to_total)) +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  theme_minimal() +
+  labs(x = "Trial", y = "Ratio of Known Cell to Total", title = "Ratio of Known Cells over Trials")
+
+
+social_cell_summary <- data %>%
+  filter(phases == "accumulation") %>%
+  group_by(trial) %>%
+  summarise(
+    true_count = sum(social_info_use == "copy"),
+    false_count = sum(social_info_use == "ignore"),
+    total = n(),
+    ratio_true_to_total = true_count / total
+  )
+
+head(social_cell_summary)
+
+# Plot the ratio over trials
+ggplot(social_cell_summary, aes(x = trial, y = ratio_true_to_total)) +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  theme_minimal() +
+  labs(x = "Trial", y = "Ratio of Social Information Usage to Total", title = "Ratio of Social Information Usage over Trials")
+
+```
+
+```{r}
+data <- data %>%
+  mutate(
+    previous_social_info_use = lag(social_info_use),
+    color_class_change_category = case_when(
+      color_class_change > 0 ~ "increase",
+      color_class_change == 0 ~ "same",
+      color_class_change < 0 ~ "decrease",
+      TRUE ~ NA_character_ # For NA values in color_class_change
+    )
+  )
+
+likelihoods <- data %>%
+  filter(previous_social_info_use == "ignore", known_cell == FALSE) %>%
+  group_by(previous_color_class) %>%
+  summarise(
+    total = n(),
+    likelihood_increase = sum(color_class_change_category == "increase") / total,
+    likelihood_same = sum(color_class_change_category == "same") / total,
+    likelihood_decrease = sum(color_class_change_category == "decrease") / total
+  ) %>%
+  ungroup()
+print(likelihoods)
+
+likelihoods <- likelihoods %>%
+  na.omit()
+
+# Pivot the data to a longer format
+likelihoods_long <- likelihoods %>%
+  pivot_longer(cols = c(likelihood_increase, likelihood_same, likelihood_decrease),
+               names_to = "Change",
+               values_to = "Likelihood")
+
+# Convert Change to a factor and specify level order
+likelihoods_long$Change <- factor(likelihoods_long$Change, levels = c("likelihood_decrease", "likelihood_same", "likelihood_increase"))
+
+# Create the plot
+ggplot(likelihoods_long, aes(x = as.factor(previous_color_class), y = Likelihood, fill = Change)) +
+  geom_bar(stat = "identity", color = "black") +
+  labs(x = "Previous Color Class", y = "Likelihood", fill = "Color Class Change",
+       title = "Likelihood of Color Class Change per Previous Color Class for individual Exploration") +
+  scale_fill_brewer(palette = "Spectral") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Identify first copying of a social_info_use per cell for each unique round
+data <- data %>%
+  arrange(unique_rounds, player, trial) %>%
+  group_by(unique_rounds, player, cell) %>%
+  mutate(first_copy = ifelse(row_number() == 1 & social_info_use == "copy", TRUE, FALSE)) %>%
+  ungroup()
+
+# Now we calculate the likelihoods of each color class for each unique social value
+color_class_likelihoods <- data %>%
+  filter(first_copy == TRUE) %>%
+  group_by(social_value) %>%
+  count(color_class) %>%
+  group_by(social_value) %>%
+  mutate(total = sum(n),
+         likelihood = n / total) %>%
+  ungroup()
+
+# Print the data
+color_class_likelihoods
+
+# Renaming and reordering columns
+color_class_likelihoods <- color_class_likelihoods %>%
+  rename(
+    SocialValue = social_value,
+    ColorClass = color_class,
+    Count = n,
+    Total = total,
+    Likelihood = likelihood
+  ) %>%
+  select(SocialValue, ColorClass, Likelihood, Count, Total)
+
+# Plotting
+ggplot(color_class_likelihoods, aes(x = as.factor(SocialValue), y = Likelihood, fill = as.factor(ColorClass))) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_brewer(palette = "Spectral") +
+  labs(
+    title = "Likelihood of Color Classes if Copying per Social Value",
+    x = "Social Value",
+    y = "Likelihood",
+    fill = "Color Class"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Add initial color class for each cell in each unique round
+data <- data %>%
+  group_by(unique_rounds, cell) %>%
+  mutate(initial_color_class = first(color_class)) %>%
+  ungroup()
+
+# Calculate the color class change and classify it as 'increase', 'decrease', or 'same'
+data <- data %>%
+  mutate(
+    color_class_change = color_class - initial_color_class,
+    color_class_change_category = case_when(
+      color_class_change > 0 ~ "increase",
+      color_class_change == 0 ~ "same",
+      color_class_change < 0 ~ "decrease"
+    )
+  )
+
+# Filter data for known_cell = TRUE and phases not 'gem'
+data_filtered <- data %>%
+  filter(known_cell == TRUE, phases != "gem")
+# Calculate the total for each change category within each initial color class
+drift_likelihoods <- data_filtered %>%
+  group_by(initial_color_class, color_class_change_category) %>%
+  summarise(
+    total = n()
+  ) %>%
+  ungroup()
+
+# Calculate the total for each initial color class
+total_per_initial_color_class <- data_filtered %>%
+  group_by(initial_color_class) %>%
+  summarise(
+    total_initial = n()
+  )
+
+# Join the two data frames
+drift_likelihoods <- left_join(drift_likelihoods, total_per_initial_color_class, by = "initial_color_class")
+
+# Calculate the likelihood
+drift_likelihoods <- drift_likelihoods %>%
+  mutate(likelihood = total / total_initial)
+
+# View the updated data
+print(drift_likelihoods)
+
+# Convert color_class_change_category to a factor and specify level order
+drift_likelihoods$color_class_change_category <- factor(drift_likelihoods$color_class_change_category, levels = c("decrease", "same", "increase"))
+
+# Create the plot
+ggplot(drift_likelihoods, aes(x = as.factor(initial_color_class), y = likelihood, fill = color_class_change_category)) +
+  geom_bar(stat = "identity", color = "black") +
+  labs(x = "Initial Color Class", y = "Likelihood", fill = "Color Class Change",
+       title = "Likelihood of Color Class Change per Initial Color Class for Known Cells (Non-gem Phases)") +
+  scale_fill_brewer(palette = "Spectral") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code.
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*.
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
