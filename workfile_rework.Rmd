@@ -1,5 +1,5 @@
 ---
-title: "R Notebook"
+title: "RMarkdown Workfile"
 output: html_notebook
 ---
 
@@ -192,7 +192,7 @@ generate_heatmap(mat, mat, "First Trial for each Round.\nCell Selection, Absolut
 generate_heatmap(mat, mat, "First Trial for each Round.\nCell Selection, Relative Numbers")
 ```
 
-Heat map for all moves:
+### Heat map for all moves:
 
 ```{r}
 # Define the range of trials to consider
@@ -313,7 +313,7 @@ heatmap.2(mat, trace = "none", dendrogram = "none", Rowv = FALSE, Colv = FALSE,
 print(sum(first_trials_counts$rel_Freq))
 ```
 
-Determine distances
+### Determine distances
 
 ```{r}
 # Load necessary packages
@@ -593,7 +593,6 @@ ggplot(summary_data, aes(x=threshold_exploitation_color_class, fill=as.factor(th
   geom_bar(position="identity", alpha=0.5, width=1) +
   labs(x="Threshold Exploitation Color Class (adjusted)", y="Count", fill="Color Class") +
   theme_minimal()
-
 ```
 
 ```{r}
