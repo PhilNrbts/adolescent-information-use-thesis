@@ -1,0 +1,79 @@
+---
+title: "Modelfitting"
+author: "Simon&Andrea"
+date: '2022-10-120'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(tidyverse, rjson, DEoptim, doParallel, here,data.table,jsonlite,lme4,nnet,brms)
+knitr::opts_knit$set(root.dir = here()) # set root fot the whole file
+refit=T
+```
+
+In this document, we will fit learning model to the "social bandit" task that Andrea and I developed. 
+First, lets load some data.
+
+```{r}
+
+## load behavioral data
+social_data <-  read_csv(file = paste0("./data/social/data_social_all_participants.csv")) %>%#drop_na()
+  filter(tot_points>0 & !is.na(demo_type))%>%#filter(player<30)%>%# get a sub-sample of both adults and adolescents 
+  mutate(soctype=case_when(
+    demo_type=="gem_found"~1,# i need that to index the different social weight parameters
+    demo_type=="gem_not_found"~2,
+    demo_type=="never_exploit"~3,
+    demo_type=="no_gem"~4)
+  )
+```
+
+# Fit model to social data
+This function fits the model specified in models_mle and stores the parameter estimates as well as the fit index (lower is better)
+alongside the participant data in long format. In the future we want to modify this to fit different models.
+
+There is a credible interaction between SI use and agegroup
+```{r}
+social_data%>%group_by(demo_type,player,round,group)%>%
+  count(social_info_use)%>%filter(!is.na(social_info_use))%>%filter(social_info_use=="copy")%>%
+  ggplot(aes(x=round,y=n,color=group))+
+  stat_summary()+
+  stat_smooth(method="lm")+
+  facet_wrap(.~demo_type)+
+  theme_minimal()
+
+
+```
+
+```{r}
+mod_full_data<-social_data%>%group_by(demo_type,player,round,group)%>%
+  count(social_info_use)%>%filter(!is.na(social_info_use))%>%filter(social_info_use=="copy")%>%
+  brms::brm(n~group*demo_type+round,data=.,family="poisson",chains=4,cores=4)
+
+sjPlot::tab_model(mod_full_data)
+
+plot_model(mod_full_data, type = "pred", terms = c("c12hour", "barthtot [30,50,70]", "c161sex"))
+
+```
+
+#TODO
+How much do the copying choices deviate from randomness?
+
+```{r}
+mod_gem_found<-social_data%>%group_by(demo_type,player,round,group)%>%
+  count(social_info_use)%>%filter(!is.na(social_info_use))%>%filter(demo_type=="gem_found")%>%
+  brms::brm(n~group,data=.,family="poisson",chains=4,cores=4)
+
+mod_gem_not_found<-social_data%>%group_by(demo_type,player,round,group)%>%
+  count(social_info_use)%>%filter(!is.na(social_info_use))%>%filter(demo_type=="gem_not_found")%>%
+  brms::brm(n~group,data=.,family="poisson",chains=4,cores=4)
+
+mod_never_exploit<-social_data%>%group_by(demo_type,player,round,group)%>%
+  count(social_info_use)%>%filter(!is.na(social_info_use))%>%filter(demo_type=="never_exploit")%>%
+  brms::brm(n~group,data=.,family="poisson",chains=4,cores=4)
+
+mod_no_gem<-social_data%>%group_by(demo_type,player,round,group)%>%
+  count(social_info_use)%>%filter(!is.na(social_info_use))%>%filter(demo_type=="no_gem")%>%
+  brms::brm(n~group,data=.,family="poisson",chains=4,cores=4)
+```
+# multilevel model logit?
+

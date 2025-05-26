@@ -1,0 +1,282 @@
+---
+title: "Modelfitting"
+author: "Simon&Andrea"
+date: '2023-08-22'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(tidyverse, rjson, DEoptim, doParallel, here,data.table,jsonlite,lme4,nnet)
+knitr::opts_knit$set(root.dir = here()) # set root fot the whole file
+## loads the script where the learning models are specified (Q-learning, social Q-learning, UCB etc)
+```
+
+# About
+
+This here loads all reasonable models and compares them and then plots some stuff for the winning model and makes simulations
+
+```{r}
+source('./C_modelfittingCode/learning_models.R')
+
+## load functions that perform Maximul Likelihood Estimation
+source("./C_modelfittingCode/models_mle.R")
+
+## load functions that initialize the model fit
+source("./C_modelfittingCode/model_fitting_functions_social_bandits.R")
+
+## load behavioral data
+social_data <-  read_csv(file = paste0("./data/social/data_social_all_participants.csv")) %>%#drop_na()
+  filter(tot_points>0 & !is.na(demo_type))%>%#filter(player<30)%>%# get a sub-sample of both adults and adolescents 
+  mutate(soctype=case_when(
+    demo_type=="gem_found"~1,# i need that to index the different social weight parameters
+    demo_type=="gem_not_found"~2,
+    demo_type=="never_exploit"~3,
+    demo_type=="no_gem"~4)
+  )
+```
+
+# Load models
+Down here i load all different model fits and check which model fits the data best.
+Model comparsion is done based on predictive accuracy on a held out dataset.
+
+
+```{r}
+#path where model fits are stored
+fits_path<-"A_GeneratedFiles/modelfits/social_models/all_envs/"
+
+#define relevant models (those that have been fit on all environments and evaluated fit on a held out dataset)
+modelspace_path<-c(
+  "kalman_ucb_softmax_egreedy/",
+  "kalman_ucb_sw_softmax_egreedy/",
+  # "kalman_ucb_slr_softmax_egreedy/",
+  #"kalman_ucb_asw_softmax_egreedy",
+  "utility_2lr_4sw_softmax_egreedy/",
+  "utility_2lr_sw_softmax_egreedy/",
+  "utility_2lr_softmax_egreedy/"
+  #"Q2lr_sw_2greedy/"#only greedy
+)
+
+#container for fit dfs
+fit_dfs<-list()
+
+for (i in 1:length(modelspace_path)){
+  #list modelfits
+  social_fits<-list.files(
+    paste0(
+      fits_path,
+      modelspace_path[i]
+    )
+  )
+  
+  #only get dataframes
+  social_fits_files<-social_fits[
+    list.files(
+      paste0(
+        fits_path,
+        modelspace_path[i]
+      )
+    )%>%startsWith(.,"data")
+  ]
+  
+  #load fits
+  fit_dfs[[i]]<-social_fits_files%>%
+    purrr::map_dfr(.,~{
+      #concat dfs
+      d1<-readRDS(
+        paste0(
+          fits_path,
+          modelspace_path[i],
+          .x
+        )
+      )%>%tibble()%>%select(fit,player,group)%>%
+        unique()%>%
+        mutate(model=modelspace_path[i],
+               model_idx=i
+        )
+      return(d1)
+    })
+}
+
+fit_df<-do.call("rbind",fit_dfs)
+
+```
+
+# Compare models
+
+```{r}
+n_pars=c(4,5,8,5,4)
+
+fit_df%>%group_by(model,group,player)%>%
+  mutate(bic=n_pars[model_idx]*log(25*12)*2*fit)%>%
+  group_by(model,group)%>%
+  summarize(m_bic=mean(bic,na.rm=T))%>%
+  group_by(group)%>%
+  mutate(winner=ifelse(m_bic==min(m_bic),1,0))
+```
+
+```{r}
+fit_df%>%group_by(model,group,player)%>%
+  mutate(bic=n_pars[model_idx]*log(25*12)*2*fit)%>%
+  group_by(model,group)%>%
+  summarize(m_bic=mean(bic,na.rm=T))%>%
+  group_by(group)%>%
+  mutate(winner=ifelse(m_bic==min(m_bic),1,0))%>%
+  mutate(m_bic=m_bic-min(m_bic))%>%
+  ggplot(aes(x=model,y=m_bic,fill=group))+
+  geom_bar(stat="identity",position="dodge")+
+  ylab("bic_diff")+
+  theme_minimal(14)+
+  theme(axis.text.x = element_text(angle=45,hjust=1))
+```
+
+# Load winning model and plot parameters
+
+```{r}
+winnig_model_path<-"A_GeneratedFiles/modelfits/social_models/all_envs/kalman_ucb_softmax_egreedy/"
+#   interesting that it only reads the correct df and not the list 
+#only get dataframes
+winning_fits_files<-list.files(winnig_model_path)[
+  list.files(winnig_model_path)%>%startsWith(.,"data")
+]
+
+winning_model<-winning_fits_files%>%
+  purrr::map_dfr(.,~{
+    #concat dfs
+    d1<-readRDS(
+      paste0(
+        winnig_model_path,
+        .x
+      )
+    )
+    return(d1)
+  }
+  )
+```
+
+# Simulate winning model.
+
+```{r}
+
+random_G2s <-  -2 * (log((1 / 64)) * 24)*12
+
+source("./B_SimulationCode/load_environments_social_experiment.R") # environments
+source("./C_modelfittingCode/models_mle.R")
+source("./C_modelfittingCode/learning_models.R") # modelcode for simulation
+source("./B_SimulationCode/sim_models.R") # modelcode for simulation
+
+#environment files are in generated files
+environments <- load_envs_social(path = "./A_GeneratedFiles/")
+social_sims_plot_d <- list()
+social_sims_plot_one <- list()
+
+# ENVIRONMENTINDEXING FOR SIMS is 1:8
+#for (i in 1:100){
+#  print(i)
+# social_sims_plot_d[[i]]<-foreach(
+#   player_nr = unique(social_fits$player),
+i <- 1
+rn <- i
+#   .packages = c("DEoptim", "dplyr"),
+#   .combine="rbind"
+# ) %do% {
+social_fits_dNa<-winning_model
+
+#filter out participants that could not be fit and wierd trials that have na values in environments
+social_fits_dNa<-social_fits_dNa%>%filter(!is.na(fit),!is.na(env_number))
+
+for (player_nr in unique(social_fits_dNa$uniqueID)) {
+  Xnew <-
+    as.matrix(expand.grid(0:7, 0:7)) # do this outside the loop for better speed
+  output <- c()
+  print(player_nr)
+  
+  # social data TODO: concatenate nonsocial data.
+  d1 <- social_fits_dNa %>% filter(uniqueID == player_nr) %>%
+    group_by(round) %>%
+    mutate(z = points,
+           #(points - mean(points)) /sd(points),
+           social_info = social_info,
+           choices = cells) %>% rowwise() %>%
+    mutate(social_info = ifelse(social_info == 64, 1, social_info)) %>%
+    ungroup()
+  
+  #### unpack parameters
+  estimates <- c(unique(d1$error_var),
+                 unique(d1$beta),
+                 unique(d1$tau),
+                 unique(d1$epsilon_gem)
+                 
+  )
+  ####
+  #for (r in rounds) { # loop through rounds in roundList
+  cv <- simualte_bmt_ucb_softmax_egreedy(
+    par = estimates,
+    learning_model_fun = bayesianMeanTracker,
+    acquisition_fun = ucb,
+    data = d1,
+    envs = environments
+  ) # only try one sub
+  #collect fitted parameters and fit index and return
+  #social_data$modelfit=cv
+  #output <- rbind(output, cv)
+  #}
+  cv$player = player_nr
+  cv$group = unique(d1$group)
+  cv$run = rn
+  social_sims_plot_one[[player_nr]] <- cv
+}
+
+social_sims_plot_d[[i]] <- do.call("rbind", social_sims_plot_one)
+
+#}
+
+social_sims_plot_dhuge <- do.call("rbind", social_sims_plot_d)
+```
+
+#show performance
+```{r fig.width=5}
+gem<-environments%>%group_by(env)%>%
+  summarise(gem=mean(gems))%>%arrange(env)%>%
+  pull(gem)
+
+social_sims_plot_dhuge %>%mutate(gem=ifelse(envi>4,1,0))%>%
+  dplyr::group_by(trial, player, group,gem) %>%
+  filter(trial > 0) %>%
+  #filter(group!="adults")%>%
+  dplyr::summarise(m_rew = mean(z))%>%mutate(pats_or_sim="sims")->sims
+
+social_fits_dNa %>%filter(!is.na(env_number))%>%mutate(gem=ifelse(env_number>4,1,0))%>%
+  dplyr::group_by(trial, player, group,gem) %>%
+  filter(trial > 0) %>% #filter(group!="adults")%>%
+  dplyr::summarise(m_rew = mean(points)) %>%mutate(pats_or_sim="pats")->pats
+
+what_is_this<-right_join(social_sims_plot_dhuge,social_fits_dNa,by=c("player","trial","round"))
+          
+simsub_dat<-rbind(sims,pats)
+
+labeller_patsim=c(
+  "pats"="participants",
+  "sims"="simulations"
+)
+
+labeller_gem=c(
+  "0"="no gem",
+  "1"="gem"
+)
+
+simsub_dat%>%
+  ggplot(aes(x = trial, y = m_rew, color = group,linetype=pats_or_sim)) +
+  ggtitle("Simulations") +
+  stat_summary() +
+  stat_smooth(method = "lm") +
+  facet_wrap(pats_or_sim~gem,
+             labeller = labeller(
+               pats_or_sim = labeller_patsim,
+               gem=labeller_gem
+             ))+
+  theme_bw() -> comp_plot
+
+
+comp_plot
+```
+
